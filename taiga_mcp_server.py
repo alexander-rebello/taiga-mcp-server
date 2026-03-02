@@ -136,25 +136,6 @@ class TaigaMCPServer:
                     },
                 ),
                 Tool(
-                    name="get_backlog",
-                    description="Get the complete backlog (user stories + issues) for a specific project",
-                    inputSchema={
-                        "type": "object",
-                        "properties": {
-                            "project_id": {
-                                "type": "integer",
-                                "description": "The ID of the project",
-                            },
-                            "limit": {
-                                "type": "integer",
-                                "description": "Max number of items to return (default: 100)",
-                                "default": 100,
-                            },
-                        },
-                        "required": ["project_id"],
-                    },
-                ),
-                Tool(
                     name="get_project_backlog",
                     description="(Deprecated: use get_user_stories or get_backlog) Get the backlog (user stories) for a specific project",
                     inputSchema={
@@ -209,6 +190,33 @@ class TaigaMCPServer:
                         "required": ["project_id", "issue_id"],
                     },
                 ),
+                Tool(
+                    name="add_issue_comment_and_reassign",
+                    description="Add a comment to an issue and reassign it back to the previous assignee. Use when something is fixed or when you need to ask for more information.",
+                    inputSchema={
+                        "type": "object",
+                        "properties": {
+                            "project_id": {
+                                "type": "integer",
+                                "description": "The ID of the project",
+                            },
+                            "issue_id": {
+                                "type": "integer",
+                                "description": "The ID of the issue",
+                            },
+                            "comment_text": {
+                                "type": "string",
+                                "description": "The comment to add to the issue",
+                            },
+                            "is_fixed": {
+                                "type": "boolean",
+                                "description": "If true, append 'Everything is fixed and should be tested'. If false, the comment is treated as a question/request for more info.",
+                                "default": True,
+                            },
+                        },
+                        "required": ["project_id", "issue_id", "comment_text"],
+                    },
+                ),
             ]
 
         @self.server.call_tool()
@@ -232,8 +240,6 @@ class TaigaMCPServer:
                     return self.handle_get_user_stories(arguments)
                 elif name == "get_issues":
                     return self.handle_get_issues(arguments)
-                elif name == "get_backlog":
-                    return self.handle_get_backlog(arguments)
                 elif name == "get_project_backlog":
                     # Deprecated: redirect to get_user_stories
                     return self.handle_get_user_stories(arguments)
@@ -241,6 +247,8 @@ class TaigaMCPServer:
                     return self.handle_get_user_story_details(arguments)
                 elif name == "get_issue_details":
                     return self.handle_get_issue_details(arguments)
+                elif name == "add_issue_comment_and_reassign":
+                    return self.handle_add_issue_comment_and_reassign(arguments)
                 else:
                     return CallToolResult(
                         content=[
@@ -256,22 +264,13 @@ class TaigaMCPServer:
                 )
 
     def handle_get_current_project(self) -> CallToolResult:
-        """Get the default project from environment variable or first project"""
+        """Get the project specified by DEFAULT_PROJECT_ID environment variable"""
         try:
             if not self.api:
                 raise RuntimeError("API not initialized")
 
-            # Try to get the project by DEFAULT_PROJECT_ID
-            try:
-                project = self.api.projects.get(DEFAULT_PROJECT_ID)
-            except TaigaRestException:
-                # Fall back to first project if default doesn't exist
-                projects = self.api.projects.list()
-                if not projects:
-                    return CallToolResult(
-                        content=[TextContent(type="text", text="No projects found")],
-                    )
-                project = projects[0]
+            # Get the project by DEFAULT_PROJECT_ID
+            project = self.api.projects.get(DEFAULT_PROJECT_ID)
 
             project_info = {
                 "id": project.id,
@@ -500,143 +499,6 @@ class TaigaMCPServer:
                 isError=True,
             )
 
-    def handle_get_backlog(self, arguments: dict) -> CallToolResult:
-        """Get complete backlog (user stories + issues) for a project"""
-        try:
-            if not self.api:
-                raise RuntimeError("API not initialized")
-
-            project_id = arguments.get("project_id")
-            limit = arguments.get("limit", 100)
-
-            if not project_id:
-                return CallToolResult(
-                    content=[
-                        TextContent(type="text", text="Error: project_id is required")
-                    ],
-                    isError=True,
-                )
-
-            # Get user stories
-            user_stories = self.api.user_stories.list(
-                project=project_id, status__is_closed=False
-            )
-
-            # Get issues
-            issues = self.api.issues.list(project=project_id)
-
-            # Format items
-            items = []
-
-            # Add user stories
-            for story in user_stories:
-                assigned_to = None
-                if (
-                    hasattr(story, "assigned_to_extra_info")
-                    and story.assigned_to_extra_info
-                ):
-                    assigned_to = story.assigned_to_extra_info.get("full_name")
-
-                status_name = None
-                if hasattr(story, "status_extra_info") and story.status_extra_info:
-                    status_name = story.status_extra_info.get("name")
-
-                items.append(
-                    {
-                        "type": "user_story",
-                        "id": story.id,
-                        "ref": story.ref,
-                        "subject": story.subject,
-                        "status": status_name or getattr(story, "status", None),
-                        "assigned_to": assigned_to,
-                        "tags": getattr(story, "tags", []),
-                    }
-                )
-
-            # Add issues
-            for issue in issues:
-                assigned_to = None
-                if (
-                    hasattr(issue, "assigned_to_extra_info")
-                    and issue.assigned_to_extra_info
-                ):
-                    assigned_to = issue.assigned_to_extra_info.get("full_name")
-
-                status_name = None
-                if hasattr(issue, "status_extra_info") and issue.status_extra_info:
-                    status_name = issue.status_extra_info.get("name")
-
-                priority_name = None
-                if hasattr(issue, "priority_extra_info") and issue.priority_extra_info:
-                    priority_name = issue.priority_extra_info.get("name")
-
-                items.append(
-                    {
-                        "type": "issue",
-                        "id": issue.id,
-                        "ref": issue.ref,
-                        "subject": issue.subject,
-                        "status": status_name or getattr(issue, "status", None),
-                        "priority": priority_name or getattr(issue, "priority", None),
-                        "assigned_to": assigned_to,
-                        "tags": getattr(issue, "tags", []),
-                    }
-                )
-
-            # Limit results
-            if limit and len(items) > limit:
-                items = items[:limit]
-
-            if not items:
-                return CallToolResult(
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=f"No backlog items found for project {project_id}",
-                        )
-                    ],
-                )
-
-            # Format output
-            output = f"Backlog for project {project_id}: {len(items)} items\n"
-            output += (
-                f"  {sum(1 for i in items if i['type'] == 'user_story')} user stories, "
-            )
-            output += f"{sum(1 for i in items if i['type'] == 'issue')} issues\n\n"
-
-            for idx, item in enumerate(items, 1):
-                item_type = "US" if item["type"] == "user_story" else "ISSUE"
-                output += f"{idx}. [{item_type} #{item['ref']}] {item['subject']}\n"
-                if item["assigned_to"]:
-                    output += f"   Assigned to: {item['assigned_to']}\n"
-                if item["status"]:
-                    output += f"   Status: {item['status']}\n"
-                if item.get("priority"):
-                    output += f"   Priority: {item['priority']}\n"
-                if item["tags"]:
-                    tags_str = ", ".join(
-                        tag if isinstance(tag, str) else str(tag)
-                        for tag in item["tags"]
-                    )
-                    output += f"   Tags: {tags_str}\n"
-                output += "\n"
-
-            return CallToolResult(
-                content=[TextContent(type="text", text=output)],
-            )
-        except TaigaRestException as e:
-            logger.error(f"Taiga API error: {str(e)}")
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Taiga API Error: {str(e)}")],
-                isError=True,
-            )
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}", exc_info=True)
-            return CallToolResult(
-                content=[TextContent(type="text", text=f"Error: {str(e)}")],
-                isError=True,
-            )
-
     def handle_get_project_backlog(self, arguments: dict) -> CallToolResult:
         """(Deprecated) Get backlog for a specific project - redirects to get_user_stories"""
         return self.handle_get_user_stories(arguments)
@@ -847,6 +709,141 @@ class TaigaMCPServer:
                 output += f"\nCreated: {issue.created_date}\n"
             if hasattr(issue, "modified_date") and issue.modified_date:
                 output += f"Modified: {issue.modified_date}\n"
+
+            return CallToolResult(
+                content=[TextContent(type="text", text=output)],
+            )
+        except TaigaRestException as e:
+            logger.error(f"Taiga API error: {str(e)}")
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Taiga API Error: {str(e)}")],
+                isError=True,
+            )
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}", exc_info=True)
+            return CallToolResult(
+                content=[TextContent(type="text", text=f"Error: {str(e)}")],
+                isError=True,
+            )
+
+    def handle_add_issue_comment_and_reassign(self, arguments: dict) -> CallToolResult:
+        """Add a comment to an issue and reassign it back to the previous assignee"""
+        try:
+            if not self.api:
+                raise RuntimeError("API not initialized")
+
+            project_id = arguments.get("project_id")
+            issue_id = arguments.get("issue_id")
+            comment_text = arguments.get("comment_text", "")
+            is_fixed = arguments.get("is_fixed", True)
+
+            if not project_id or not issue_id or not comment_text:
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text="Error: project_id, issue_id, and comment_text are required",
+                        )
+                    ],
+                    isError=True,
+                )
+
+            # Get the issue
+            issue = self.api.issues.get(issue_id)
+
+            if not issue:
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=f"Issue {issue_id} not found in project {project_id}",
+                        )
+                    ],
+                    isError=True,
+                )
+
+            requester = issue.requester
+
+            # Get the history to find the previous assignee
+            response = requester.get(f"/history/issue/{issue.id}")
+            history = response.json()
+
+            # Parse history to find who had it before the current user
+            previous_assignee_id = None
+            previous_assignee_name = None
+
+            # Look through history to find assignment changes
+            # diff["assigned_to"] contains [old_id, new_id] where values are user IDs
+            assignment_changes = []
+            for item in history:
+                if item.get("diff") and "assigned_to" in item["diff"]:
+                    diff = item["diff"]["assigned_to"]
+                    if isinstance(diff, list) and len(diff) >= 2:
+                        assignment_changes.append({
+                            "old_id": diff[0],
+                            "new_id": diff[1],
+                            "item": item
+                        })
+            
+            # Get the previous assignee from the changes
+            # If the most recent is "None → X", look at the next one
+            # Otherwise, the old_id from the most recent change is the previous assignee
+            if assignment_changes:
+                most_recent = assignment_changes[0]
+                
+                # If most recent is unassigned → assigned, look for the person before unassignment
+                if most_recent["old_id"] is None and len(assignment_changes) > 1:
+                    # Look for the entry where someone is unassigning themselves
+                    for change in assignment_changes[1:]:
+                        if change["old_id"] is not None:  # Someone exists before
+                            previous_assignee_id = change["old_id"]
+                            # Get the name
+                            item = change["item"]
+                            if item.get("values") and item["values"].get("users"):
+                                users = item["values"]["users"]
+                                previous_assignee_name = users.get(str(previous_assignee_id))
+                            break
+                else:
+                    # Most recent change already shows who had it before
+                    if most_recent["old_id"] is not None:
+                        previous_assignee_id = most_recent["old_id"]
+                        item = most_recent["item"]
+                        if item.get("values") and item["values"].get("users"):
+                            users = item["values"]["users"]
+                            previous_assignee_name = users.get(str(previous_assignee_id))
+
+            # Prepare the comment
+            final_comment = comment_text
+            if is_fixed:
+                final_comment += "\n\nEverything is fixed and should be tested."
+
+            # Prepare the update payload
+            update_payload = {
+                "comment": final_comment,
+                "version": issue.version,
+            }
+
+            # Add reassignment if we found a previous assignee
+            if previous_assignee_id:
+                update_payload["assigned_to"] = previous_assignee_id
+
+            # Update the issue via raw API
+            response = requester.put(
+                "/{endpoint}/{id}",
+                endpoint=issue.endpoint,
+                id=issue.id,
+                payload=update_payload,
+            )
+
+            result_data = response.json()
+
+            # Format output
+            assignee_info = ""
+            if previous_assignee_id and previous_assignee_name:
+                assignee_info = f" and reassigned to {previous_assignee_name}"
+
+            output = f"Comment added to issue #{issue.ref}{assignee_info}\n\n"
+            output += f"Comment:\n{final_comment}"
 
             return CallToolResult(
                 content=[TextContent(type="text", text=output)],
