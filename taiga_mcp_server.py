@@ -10,7 +10,10 @@ import json
 import logging
 import os
 import sys
+from pathlib import Path
 from typing import Any
+
+import requests
 
 try:
     from mcp.server import Server
@@ -46,6 +49,7 @@ TAIGA_USERNAME = os.getenv("TAIGA_USERNAME", "")
 TAIGA_PASSWORD = os.getenv("TAIGA_PASSWORD", "")
 TAIGA_TOKEN = os.getenv("TAIGA_TOKEN", "")
 DEFAULT_PROJECT_ID = int(os.getenv("DEFAULT_PROJECT_ID", "1"))
+TMP_DIR_MAX_SIZE_MB = int(os.getenv("TMP_DIR_MAX_SIZE_MB", "500"))
 
 
 class TaigaMCPServer:
@@ -112,6 +116,11 @@ class TaigaMCPServer:
                                 "description": "Max number of items to return (default: 100)",
                                 "default": 100,
                             },
+                            "get_assigned": {
+                                "type": "boolean",
+                                "description": "If true, only return stories assigned to the current user (default: true)",
+                                "default": True,
+                            },
                         },
                         "required": ["project_id"],
                     },
@@ -130,6 +139,11 @@ class TaigaMCPServer:
                                 "type": "integer",
                                 "description": "Max number of items to return (default: 100)",
                                 "default": 100,
+                            },
+                            "get_assigned": {
+                                "type": "boolean",
+                                "description": "If true, only return issues assigned to the current user (default: true)",
+                                "default": True,
                             },
                         },
                         "required": ["project_id"],
@@ -316,6 +330,7 @@ class TaigaMCPServer:
 
             project_id = arguments.get("project_id")
             limit = arguments.get("limit", 100)
+            get_assigned = arguments.get("get_assigned", True)
 
             if not project_id:
                 return CallToolResult(
@@ -325,21 +340,39 @@ class TaigaMCPServer:
                     isError=True,
                 )
 
+            # Get current user if filtering by assigned
+            current_user_id = None
+            if get_assigned:
+                try:
+                    current_user = self.api.me()
+                    current_user_id = current_user.id
+                except Exception as e:
+                    logger.warning(f"Could not get current user: {str(e)}")
+
             # Get user stories (backlog items)
             user_stories = self.api.user_stories.list(
                 project=project_id, status__is_closed=False
             )
+
+            # Filter by assigned user if requested
+            if get_assigned and current_user_id:
+                user_stories = [
+                    story
+                    for story in user_stories
+                    if story.assigned_to == current_user_id
+                ]
 
             # Limit results
             if limit and len(user_stories) > limit:
                 user_stories = user_stories[:limit]
 
             if not user_stories:
+                filter_text = " assigned to you" if get_assigned else ""
                 return CallToolResult(
                     content=[
                         TextContent(
                             type="text",
-                            text=f"No user stories found for project {project_id}",
+                            text=f"No user stories found for project {project_id}{filter_text}",
                         )
                     ],
                 )
@@ -371,7 +404,8 @@ class TaigaMCPServer:
                 items.append(item)
 
             # Format output
-            output = f"User Stories for project {project_id}: {len(items)} items\n\n"
+            filter_text = " (assigned to you)" if get_assigned else ""
+            output = f"User Stories for project {project_id}{filter_text}: {len(items)} items\n\n"
             for idx, item in enumerate(items, 1):
                 output += f"{idx}. [#{item['ref']}] {item['subject']}\n"
                 if item["blocked_note"]:
@@ -384,7 +418,9 @@ class TaigaMCPServer:
                 if item["status"]:
                     output += f"   Status: {item['status']}\n"
                 if item["tags"]:
-                    output += f"   Tags: {', '.join(item['tags'])}\n"
+                    output += (
+                        f"   Tags: {', '.join(self._normalize_tags(item['tags']))}\n"
+                    )
                 output += "\n"
 
             return CallToolResult(
@@ -411,6 +447,7 @@ class TaigaMCPServer:
 
             project_id = arguments.get("project_id")
             limit = arguments.get("limit", 100)
+            get_assigned = arguments.get("get_assigned", True)
 
             if not project_id:
                 return CallToolResult(
@@ -420,19 +457,35 @@ class TaigaMCPServer:
                     isError=True,
                 )
 
+            # Get current user if filtering by assigned
+            current_user_id = None
+            if get_assigned:
+                try:
+                    current_user = self.api.me()
+                    current_user_id = current_user.id
+                except Exception as e:
+                    logger.warning(f"Could not get current user: {str(e)}")
+
             # Get issues
             issues = self.api.issues.list(project=project_id)
+
+            # Filter by assigned user if requested
+            if get_assigned and current_user_id:
+                issues = [
+                    issue for issue in issues if issue.assigned_to == current_user_id
+                ]
 
             # Limit results
             if limit and len(issues) > limit:
                 issues = issues[:limit]
 
             if not issues:
+                filter_text = " assigned to you" if get_assigned else ""
                 return CallToolResult(
                     content=[
                         TextContent(
                             type="text",
-                            text=f"No issues found for project {project_id}",
+                            text=f"No issues found for project {project_id}{filter_text}",
                         )
                     ],
                 )
@@ -470,7 +523,10 @@ class TaigaMCPServer:
                 items.append(item)
 
             # Format output
-            output = f"Issues for project {project_id}: {len(items)} items\n\n"
+            filter_text = " (assigned to you)" if get_assigned else ""
+            output = (
+                f"Issues for project {project_id}{filter_text}: {len(items)} items\n\n"
+            )
             for idx, item in enumerate(items, 1):
                 output += f"{idx}. [#{item['ref']}] {item['subject']}\n"
                 if item["assigned_to"]:
@@ -480,7 +536,9 @@ class TaigaMCPServer:
                 if item["priority"]:
                     output += f"   Priority: {item['priority']}\n"
                 if item["tags"]:
-                    output += f"   Tags: {', '.join(item['tags'])}\n"
+                    output += (
+                        f"   Tags: {', '.join(self._normalize_tags(item['tags']))}\n"
+                    )
                 output += "\n"
 
             return CallToolResult(
@@ -693,9 +751,7 @@ class TaigaMCPServer:
             # Tags
             tags = getattr(issue, "tags", [])
             if tags:
-                tags_str = ", ".join(
-                    tag if isinstance(tag, str) else str(tag) for tag in tags
-                )
+                tags_str = ", ".join(self._normalize_tags(tags))
                 output += f"Tags: {tags_str}\n"
 
             # Related issues
@@ -709,6 +765,25 @@ class TaigaMCPServer:
                 output += f"\nCreated: {issue.created_date}\n"
             if hasattr(issue, "modified_date") and issue.modified_date:
                 output += f"Modified: {issue.modified_date}\n"
+
+            download_result = self._download_issue_attachments(
+                issue=issue,
+                project_id=project_id,
+            )
+            if download_result:
+                output += "\n\nAttachments (downloaded to local tmp):\n"
+                output += (
+                    f"Downloaded: {download_result['downloaded_count']}, "
+                    f"Skipped (non-AI-readable): {download_result['skipped_count']}, "
+                    f"Failed: {download_result['failed_count']}\n"
+                )
+                output += f"Directory: {download_result['issue_dir']}\n"
+                if download_result["downloaded_files"]:
+                    output += "Files:\n"
+                    for file_name in download_result["downloaded_files"]:
+                        output += f"- {file_name}\n"
+                if download_result["warning"]:
+                    output += f"\nWARNING: {download_result['warning']}\n"
 
             return CallToolResult(
                 content=[TextContent(type="text", text=output)],
@@ -836,27 +911,32 @@ class TaigaMCPServer:
             try:
                 project = self.api.projects.get(project_id)
                 status_list = self.api.issue_statuses.list(project=project_id)
-                
+
                 # Find the status IDs by name
                 status_id = None
                 target_status_name = "Ready for test" if is_fixed else "Needs Info"
-                
+
                 for status in status_list:
                     if status.name.lower() == target_status_name.lower():
                         status_id = status.id
                         break
-                
+
                 if not status_id:
                     # If exact match not found, try partial match
                     for status in status_list:
-                        if target_status_name.lower() in status.name.lower() or status.name.lower() in target_status_name.lower():
+                        if (
+                            target_status_name.lower() in status.name.lower()
+                            or status.name.lower() in target_status_name.lower()
+                        ):
                             status_id = status.id
                             break
-                
+
                 if not status_id:
-                    logger.warning(f"Status '{target_status_name}' not found for project {project_id}")
+                    logger.warning(
+                        f"Status '{target_status_name}' not found for project {project_id}"
+                    )
                     status_id = issue.status  # Keep current status if not found
-                    
+
             except Exception as e:
                 logger.error(f"Failed to get status options: {str(e)}")
                 status_id = issue.status  # Keep current status on error
@@ -923,6 +1003,187 @@ class TaigaMCPServer:
         if project["members_count"]:
             lines.append(f"Members: {project['members_count']}")
         return "\n".join(lines)
+
+    def _normalize_tags(self, tags: list[Any]) -> list[str]:
+        """Normalize Taiga tags to a list of displayable strings."""
+        normalized = []
+        for tag in tags:
+            if isinstance(tag, str):
+                normalized.append(tag)
+            elif isinstance(tag, (list, tuple)) and tag:
+                normalized.append(str(tag[0]))
+            else:
+                normalized.append(str(tag))
+        return normalized
+
+    def _download_issue_attachments(self, issue: Any, project_id: int) -> dict[str, Any]:
+        """Download AI-readable issue attachments to local tmp directory."""
+        base_tmp_dir = Path(__file__).resolve().parent / "tmp"
+        issue_dir = base_tmp_dir / f"issue-{issue.ref}-{issue.id}"
+        issue_dir.mkdir(parents=True, exist_ok=True)
+
+        attachments = self.api.issue_attachments.list(project=project_id, object_id=issue.id)
+
+        downloaded_files: list[str] = []
+        downloaded_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        for attachment in attachments:
+            attachment_data = (
+                attachment.to_dict()
+                if hasattr(attachment, "to_dict")
+                else attachment
+            )
+            if not isinstance(attachment_data, dict):
+                skipped_count += 1
+                continue
+
+            file_name = self._attachment_file_name(attachment_data)
+            if not self._is_ai_readable_file(file_name):
+                skipped_count += 1
+                continue
+
+            download_url = self._attachment_download_url(attachment_data)
+            if not download_url:
+                failed_count += 1
+                continue
+
+            destination = self._unique_destination_path(
+                issue_dir,
+                self._sanitize_filename(file_name),
+            )
+            ok = self._download_file(download_url, destination, issue.requester)
+            if ok:
+                downloaded_count += 1
+                downloaded_files.append(destination.name)
+            else:
+                failed_count += 1
+
+        total_size_bytes = self._directory_size_bytes(base_tmp_dir)
+        threshold_bytes = TMP_DIR_MAX_SIZE_MB * 1024 * 1024
+        warning = ""
+        if total_size_bytes > threshold_bytes:
+            warning = (
+                f"tmp directory size is {self._format_size(total_size_bytes)}, "
+                f"which exceeds TMP_DIR_MAX_SIZE_MB ({TMP_DIR_MAX_SIZE_MB} MB)."
+            )
+
+        return {
+            "downloaded_count": downloaded_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "downloaded_files": downloaded_files,
+            "issue_dir": str(issue_dir),
+            "warning": warning,
+        }
+
+    def _attachment_file_name(self, attachment: dict[str, Any]) -> str:
+        """Extract a usable filename from Taiga attachment payload."""
+        name = attachment.get("name")
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+
+        attached_file = attachment.get("attached_file")
+        if isinstance(attached_file, str) and attached_file.strip():
+            return Path(attached_file).name
+
+        url = attachment.get("url")
+        if isinstance(url, str) and url.strip():
+            clean_url = url.split("#", 1)[0].split("?", 1)[0]
+            return Path(clean_url).name
+
+        return "attachment.bin"
+
+    def _attachment_download_url(self, attachment: dict[str, Any]) -> str:
+        """Build or extract download URL for a Taiga attachment."""
+        url = attachment.get("url")
+        if isinstance(url, str) and url.strip():
+            return url
+
+        attached_file = attachment.get("attached_file")
+        if isinstance(attached_file, str) and attached_file.strip():
+            relative_path = attached_file.lstrip("/")
+            return f"{TAIGA_HOST.rstrip('/')}/media/{relative_path}"
+
+        return ""
+
+    def _is_ai_readable_file(self, file_name: str) -> bool:
+        """Allow only image and text-based attachments suitable for AI processing."""
+        extension = Path(file_name).suffix.lower()
+        ai_readable_extensions = {
+            ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".xml", ".html", ".htm",
+            ".css", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".csv", ".tsv", ".log", ".sql",
+            ".ini", ".cfg", ".conf", ".toml", ".rst", ".py", ".php", ".sh", ".bash", ".zsh",
+            ".java", ".c", ".h", ".cpp", ".hpp", ".go", ".rb", ".kt", ".swift", ".scala",
+            ".dart", ".env", ".gitignore", ".dockerfile", ".svg", ".png", ".jpg", ".jpeg",
+            ".gif", ".webp", ".bmp", ".tif", ".tiff",
+        }
+        return extension in ai_readable_extensions
+
+    def _sanitize_filename(self, file_name: str) -> str:
+        """Create a safe local filename."""
+        cleaned = file_name.replace("/", "_").replace("\\", "_").strip()
+        return cleaned or "attachment.bin"
+
+    def _unique_destination_path(self, directory: Path, file_name: str) -> Path:
+        """Ensure attachment file names do not overwrite existing files."""
+        candidate = directory / file_name
+        if not candidate.exists():
+            return candidate
+
+        stem = candidate.stem
+        suffix = candidate.suffix
+        counter = 1
+        while True:
+            candidate = directory / f"{stem}-{counter}{suffix}"
+            if not candidate.exists():
+                return candidate
+            counter += 1
+
+    def _download_file(self, url: str, destination: Path, requester: Any) -> bool:
+        """Download a file using Taiga authentication headers when needed."""
+        try:
+            headers = {}
+            if hasattr(requester, "headers"):
+                headers = requester.headers(paginate=False)
+
+            response = requests.get(url, headers=headers, timeout=60, stream=True)
+            if response.status_code >= 400:
+                logger.warning(
+                    f"Failed to download attachment from {url}. "
+                    f"Status: {response.status_code}"
+                )
+                return False
+
+            with destination.open("wb") as out_file:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        out_file.write(chunk)
+            return True
+        except Exception as exc:
+            logger.warning(f"Attachment download failed for {url}: {str(exc)}")
+            return False
+
+    def _directory_size_bytes(self, directory: Path) -> int:
+        """Get total size in bytes for a directory tree."""
+        if not directory.exists():
+            return 0
+        total = 0
+        for path in directory.rglob("*"):
+            if path.is_file():
+                total += path.stat().st_size
+        return total
+
+    def _format_size(self, size_bytes: int) -> str:
+        """Format bytes as human-readable string."""
+        units = ["B", "KB", "MB", "GB", "TB"]
+        size = float(size_bytes)
+        unit_index = 0
+        while size >= 1024 and unit_index < len(units) - 1:
+            size /= 1024
+            unit_index += 1
+        return f"{size:.2f} {units[unit_index]}"
 
     async def run(self):
         """Run the MCP server using stdio transport"""

@@ -48,3 +48,6 @@ htmlcov/
 # Environment
 .env
 .env.local
+
+# Local downloaded issue attachments
+tmp/
