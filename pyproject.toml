@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "taiga-mcp-server"
+version = "1.0.0"
+description = "MCP Server for Taiga Project Management"
+requires-python = ">=3.8"
+dependencies = [
+    "mcp>=1.0.0",
+    "python-taiga>=0.8.0"
+]
+
+[project.scripts]
+taiga-mcp-server = "taiga_mcp_server:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "black>=22.0",
+    "mypy>=0.900"
+]
