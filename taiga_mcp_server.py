@@ -198,7 +198,7 @@ class TaigaMCPServer:
                             },
                             "issue_id": {
                                 "type": "integer",
-                                "description": "The ID of the issue",
+                                "description": "Issue identifier (global issue ID, or project ref like #27 / 27)",
                             },
                         },
                         "required": ["project_id", "issue_id"],
@@ -216,7 +216,7 @@ class TaigaMCPServer:
                             },
                             "issue_id": {
                                 "type": "integer",
-                                "description": "The ID of the issue",
+                                "description": "Issue identifier (global issue ID, or project ref like #27 / 27)",
                             },
                             "comment_text": {
                                 "type": "string",
@@ -529,6 +529,7 @@ class TaigaMCPServer:
             )
             for idx, item in enumerate(items, 1):
                 output += f"{idx}. [#{item['ref']}] {item['subject']}\n"
+                output += f"   Global ID: {item['id']}\n"
                 if item["assigned_to"]:
                     output += f"   Assigned to: {item['assigned_to']}\n"
                 if item["status"]:
@@ -685,15 +686,18 @@ class TaigaMCPServer:
                     isError=True,
                 )
 
-            # Get the specific issue
-            issue = self.api.issues.get(issue_id)
+            # Get the specific issue by global ID or by project reference
+            issue = self._resolve_issue_for_project(project_id, issue_id)
 
             if not issue:
                 return CallToolResult(
                     content=[
                         TextContent(
                             type="text",
-                            text=f"Issue {issue_id} not found in project {project_id}",
+                            text=(
+                                f"Issue identifier '{issue_id}' not found in project {project_id}. "
+                                "Use either the issue Global ID or project ref (e.g. #27)."
+                            ),
                         )
                     ],
                     isError=True,
@@ -702,6 +706,8 @@ class TaigaMCPServer:
             # Format detailed information
             output = f"Issue Details - #{issue.ref}\n"
             output += "=" * 60 + "\n\n"
+            output += f"Global ID: {issue.id}\n"
+            output += f"Project Ref: #{issue.ref}\n"
             output += f"Subject: {issue.subject}\n"
 
             if hasattr(issue, "description") and issue.description:
@@ -840,15 +846,18 @@ class TaigaMCPServer:
                     isError=True,
                 )
 
-            # Get the issue
-            issue = self.api.issues.get(issue_id)
+            # Get the issue by global ID or by project reference
+            issue = self._resolve_issue_for_project(project_id, issue_id)
 
             if not issue:
                 return CallToolResult(
                     content=[
                         TextContent(
                             type="text",
-                            text=f"Issue {issue_id} not found in project {project_id}",
+                            text=(
+                                f"Issue identifier '{issue_id}' not found in project {project_id}. "
+                                "Use either the issue Global ID or project ref (e.g. #27)."
+                            ),
                         )
                     ],
                     isError=True,
@@ -1016,13 +1025,78 @@ class TaigaMCPServer:
                 normalized.append(str(tag))
         return normalized
 
-    def _download_issue_attachments(self, issue: Any, project_id: int) -> dict[str, Any]:
+    def _to_int_or_none(self, value: Any) -> int | None:
+        """Convert a value to int when possible (supports '#27' style references)."""
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value
+
+        text = str(value).strip()
+        if text.startswith("#"):
+            text = text[1:].strip()
+        if not text:
+            return None
+
+        try:
+            return int(text)
+        except (TypeError, ValueError):
+            return None
+
+    def _issue_belongs_to_project(self, issue: Any, project_id: int) -> bool:
+        """Check if an issue belongs to a given project."""
+        issue_project = getattr(issue, "project", None)
+        issue_project_id = self._to_int_or_none(issue_project)
+        if issue_project_id is not None:
+            return issue_project_id == project_id
+
+        project_extra_info = getattr(issue, "project_extra_info", None)
+        if isinstance(project_extra_info, dict):
+            issue_project_id = self._to_int_or_none(project_extra_info.get("id"))
+            if issue_project_id is not None:
+                return issue_project_id == project_id
+
+        return False
+
+    def _resolve_issue_for_project(self, project_id: int, issue_identifier: Any) -> Any:
+        """Resolve issue by global issue ID or project ref within the given project."""
+        issue_number = self._to_int_or_none(issue_identifier)
+        if issue_number is None:
+            return None
+
+        # First, try as global issue ID.
+        try:
+            candidate = self.api.issues.get(issue_number)
+            if candidate and self._issue_belongs_to_project(candidate, project_id):
+                return candidate
+        except Exception:
+            pass
+
+        # Fallback: treat the number as project reference and resolve from project issues.
+        try:
+            issues = self.api.issues.list(project=project_id)
+            for issue in issues:
+                issue_ref = self._to_int_or_none(getattr(issue, "ref", None))
+                if issue_ref == issue_number:
+                    return issue
+        except Exception:
+            pass
+
+        return None
+
+    def _download_issue_attachments(
+        self, issue: Any, project_id: int
+    ) -> dict[str, Any]:
         """Download AI-readable issue attachments to local tmp directory."""
         base_tmp_dir = Path(__file__).resolve().parent / "tmp"
         issue_dir = base_tmp_dir / f"issue-{issue.ref}-{issue.id}"
         issue_dir.mkdir(parents=True, exist_ok=True)
 
-        attachments = self.api.issue_attachments.list(project=project_id, object_id=issue.id)
+        attachments = self.api.issue_attachments.list(
+            project=project_id, object_id=issue.id
+        )
 
         downloaded_files: list[str] = []
         downloaded_count = 0
@@ -1031,9 +1105,7 @@ class TaigaMCPServer:
 
         for attachment in attachments:
             attachment_data = (
-                attachment.to_dict()
-                if hasattr(attachment, "to_dict")
-                else attachment
+                attachment.to_dict() if hasattr(attachment, "to_dict") else attachment
             )
             if not isinstance(attachment_data, dict):
                 skipped_count += 1
@@ -1112,12 +1184,58 @@ class TaigaMCPServer:
         """Allow only image and text-based attachments suitable for AI processing."""
         extension = Path(file_name).suffix.lower()
         ai_readable_extensions = {
-            ".txt", ".md", ".markdown", ".json", ".yaml", ".yml", ".xml", ".html", ".htm",
-            ".css", ".js", ".mjs", ".ts", ".tsx", ".jsx", ".csv", ".tsv", ".log", ".sql",
-            ".ini", ".cfg", ".conf", ".toml", ".rst", ".py", ".php", ".sh", ".bash", ".zsh",
-            ".java", ".c", ".h", ".cpp", ".hpp", ".go", ".rb", ".kt", ".swift", ".scala",
-            ".dart", ".env", ".gitignore", ".dockerfile", ".svg", ".png", ".jpg", ".jpeg",
-            ".gif", ".webp", ".bmp", ".tif", ".tiff",
+            ".txt",
+            ".md",
+            ".markdown",
+            ".json",
+            ".yaml",
+            ".yml",
+            ".xml",
+            ".html",
+            ".htm",
+            ".css",
+            ".js",
+            ".mjs",
+            ".ts",
+            ".tsx",
+            ".jsx",
+            ".csv",
+            ".tsv",
+            ".log",
+            ".sql",
+            ".ini",
+            ".cfg",
+            ".conf",
+            ".toml",
+            ".rst",
+            ".py",
+            ".php",
+            ".sh",
+            ".bash",
+            ".zsh",
+            ".java",
+            ".c",
+            ".h",
+            ".cpp",
+            ".hpp",
+            ".go",
+            ".rb",
+            ".kt",
+            ".swift",
+            ".scala",
+            ".dart",
+            ".env",
+            ".gitignore",
+            ".dockerfile",
+            ".svg",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".gif",
+            ".webp",
+            ".bmp",
+            ".tif",
+            ".tiff",
         }
         return extension in ai_readable_extensions
 
