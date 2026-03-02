@@ -727,7 +727,7 @@ class TaigaMCPServer:
             )
 
     def handle_add_issue_comment_and_reassign(self, arguments: dict) -> CallToolResult:
-        """Add a comment to an issue and reassign it back to the previous assignee"""
+        """Add a comment to an issue, change status, and reassign it back to the previous assignee"""
         try:
             if not self.api:
                 raise RuntimeError("API not initialized")
@@ -743,6 +743,23 @@ class TaigaMCPServer:
                         TextContent(
                             type="text",
                             text="Error: project_id, issue_id, and comment_text are required",
+                        )
+                    ],
+                    isError=True,
+                )
+
+            # Get current user
+            try:
+                current_user = self.api.me()
+                current_user_id = current_user.id
+                current_user_name = current_user.full_name_display
+            except Exception as e:
+                logger.error(f"Failed to get current user: {str(e)}")
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=f"Error: Failed to get current user: {str(e)}",
                         )
                     ],
                     isError=True,
@@ -779,29 +796,25 @@ class TaigaMCPServer:
                 if item.get("diff") and "assigned_to" in item["diff"]:
                     diff = item["diff"]["assigned_to"]
                     if isinstance(diff, list) and len(diff) >= 2:
-                        assignment_changes.append({
-                            "old_id": diff[0],
-                            "new_id": diff[1],
-                            "item": item
-                        })
-            
+                        assignment_changes.append(
+                            {"old_id": diff[0], "new_id": diff[1], "item": item}
+                        )
+
             # Get the previous assignee from the changes
-            # If the most recent is "None → X", look at the next one
-            # Otherwise, the old_id from the most recent change is the previous assignee
             if assignment_changes:
                 most_recent = assignment_changes[0]
-                
+
                 # If most recent is unassigned → assigned, look for the person before unassignment
                 if most_recent["old_id"] is None and len(assignment_changes) > 1:
-                    # Look for the entry where someone is unassigning themselves
                     for change in assignment_changes[1:]:
-                        if change["old_id"] is not None:  # Someone exists before
+                        if change["old_id"] is not None:
                             previous_assignee_id = change["old_id"]
-                            # Get the name
                             item = change["item"]
                             if item.get("values") and item["values"].get("users"):
                                 users = item["values"]["users"]
-                                previous_assignee_name = users.get(str(previous_assignee_id))
+                                previous_assignee_name = users.get(
+                                    str(previous_assignee_id)
+                                )
                             break
                 else:
                     # Most recent change already shows who had it before
@@ -810,21 +823,53 @@ class TaigaMCPServer:
                         item = most_recent["item"]
                         if item.get("values") and item["values"].get("users"):
                             users = item["values"]["users"]
-                            previous_assignee_name = users.get(str(previous_assignee_id))
+                            previous_assignee_name = users.get(
+                                str(previous_assignee_id)
+                            )
 
             # Prepare the comment
             final_comment = comment_text
             if is_fixed:
                 final_comment += "\n\nEverything is fixed and should be tested."
 
+            # Get the project to fetch status options
+            try:
+                project = self.api.projects.get(project_id)
+                status_list = self.api.issue_statuses.list(project=project_id)
+                
+                # Find the status IDs by name
+                status_id = None
+                target_status_name = "Ready for test" if is_fixed else "Needs Info"
+                
+                for status in status_list:
+                    if status.name.lower() == target_status_name.lower():
+                        status_id = status.id
+                        break
+                
+                if not status_id:
+                    # If exact match not found, try partial match
+                    for status in status_list:
+                        if target_status_name.lower() in status.name.lower() or status.name.lower() in target_status_name.lower():
+                            status_id = status.id
+                            break
+                
+                if not status_id:
+                    logger.warning(f"Status '{target_status_name}' not found for project {project_id}")
+                    status_id = issue.status  # Keep current status if not found
+                    
+            except Exception as e:
+                logger.error(f"Failed to get status options: {str(e)}")
+                status_id = issue.status  # Keep current status on error
+
             # Prepare the update payload
             update_payload = {
                 "comment": final_comment,
+                "status": status_id,
                 "version": issue.version,
             }
 
-            # Add reassignment if we found a previous assignee
-            if previous_assignee_id:
+            # Add reassignment if we found a previous assignee and they're not the current user
+            if previous_assignee_id and previous_assignee_id != current_user_id:
                 update_payload["assigned_to"] = previous_assignee_id
 
             # Update the issue via raw API
@@ -838,12 +883,15 @@ class TaigaMCPServer:
             result_data = response.json()
 
             # Format output
+            status_text = "Ready for test" if is_fixed else "Needs Info"
             assignee_info = ""
-            if previous_assignee_id and previous_assignee_name:
+            if previous_assignee_id and previous_assignee_id != current_user_id:
                 assignee_info = f" and reassigned to {previous_assignee_name}"
 
-            output = f"Comment added to issue #{issue.ref}{assignee_info}\n\n"
-            output += f"Comment:\n{final_comment}"
+            output = f"✓ Updated issue #{issue.ref}\n"
+            output += f"\n  Comment added\n"
+            output += f"  Status changed to: {status_text}{assignee_info}\n"
+            output += f"\n  Comment:\n  {final_comment}"
 
             return CallToolResult(
                 content=[TextContent(type="text", text=output)],
