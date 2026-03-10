@@ -918,7 +918,6 @@ class TaigaMCPServer:
 
             # Get the project to fetch status options
             try:
-                project = self.api.projects.get(project_id)
                 status_list = self.api.issue_statuses.list(project=project_id)
 
                 # Find the status IDs by name
@@ -941,41 +940,83 @@ class TaigaMCPServer:
                             break
 
                 if not status_id:
-                    logger.warning(
-                        f"Status '{target_status_name}' not found for project {project_id}"
+                    available_statuses = [s.name for s in status_list]
+                    logger.error(
+                        f"Status '{target_status_name}' not found for project {project_id}. "
+                        f"Available: {available_statuses}"
                     )
-                    status_id = issue.status  # Keep current status if not found
+                    return CallToolResult(
+                        content=[
+                            TextContent(
+                                type="text",
+                                text=(
+                                    f"Error: Status '{target_status_name}' not found in project {project_id}. "
+                                    f"Available statuses: {', '.join(available_statuses)}"
+                                ),
+                            )
+                        ],
+                        isError=True,
+                    )
 
             except Exception as e:
                 logger.error(f"Failed to get status options: {str(e)}")
-                status_id = issue.status  # Keep current status on error
+                return CallToolResult(
+                    content=[
+                        TextContent(
+                            type="text",
+                            text=f"Error: Failed to resolve issue status options: {str(e)}",
+                        )
+                    ],
+                    isError=True,
+                )
 
-            # Prepare the update payload
-            update_payload = {
+            # Determine reassignment target: previous assignee if available, otherwise issue owner (creator)
+            reassignment_id = None
+            reassignment_name = None
+            reassignment_source = None
+
+            if previous_assignee_id and previous_assignee_id != current_user_id:
+                reassignment_id = previous_assignee_id
+                reassignment_name = previous_assignee_name
+                reassignment_source = "previous assignee"
+            else:
+                owner_id = issue.owner.id if hasattr(issue.owner, "id") else issue.owner
+                if owner_id:
+                    reassignment_id = owner_id
+                    if (
+                        hasattr(issue, "owner_extra_info")
+                        and issue.owner_extra_info
+                        and isinstance(issue.owner_extra_info, dict)
+                    ):
+                        reassignment_name = issue.owner_extra_info.get(
+                            "full_name_display"
+                        )
+                    reassignment_source = "issue owner"
+
+            # Prepare partial update payload
+            patch_fields = ["version", "comment", "status"]
+            patch_kwargs = {
                 "comment": final_comment,
                 "status": status_id,
                 "version": issue.version,
             }
 
-            # Add reassignment if we found a previous assignee and they're not the current user
-            if previous_assignee_id and previous_assignee_id != current_user_id:
-                update_payload["assigned_to"] = previous_assignee_id
+            # Reassign to target user (previous assignee or issue owner fallback)
+            if reassignment_id:
+                patch_fields.append("assigned_to")
+                patch_kwargs["assigned_to"] = reassignment_id
 
-            # Update the issue via raw API
-            response = requester.put(
-                "/{endpoint}/{id}",
-                endpoint=issue.endpoint,
-                id=issue.id,
-                payload=update_payload,
-            )
-
-            result_data = response.json()
+            # Update the issue via model patch (partial update)
+            issue.patch(patch_fields, **patch_kwargs)
 
             # Format output
             status_text = "Ready for test" if is_fixed else "Needs Info"
             assignee_info = ""
-            if previous_assignee_id and previous_assignee_id != current_user_id:
-                assignee_info = f" and reassigned to {previous_assignee_name}"
+            if reassignment_id:
+                assignee_label = reassignment_name or f"user id {reassignment_id}"
+                assignee_info = (
+                    f" and reassigned to {assignee_label}" f" ({reassignment_source})"
+                )
 
             output = f"✓ Updated issue #{issue.ref}\n"
             output += f"\n  Comment added\n"
